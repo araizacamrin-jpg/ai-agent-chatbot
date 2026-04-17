@@ -1,0 +1,103 @@
+======================================================
+  RAILWAY DEPLOYMENT GUIDE — Customer Service Chatbot
+======================================================
+
+PREREQUISITES
+-------------
+- GitHub account
+- Railway account (railway.app — free tier available)
+- Claude API key from console.anthropic.com
+
+------------------------------------------------------
+STEP 1 — CREATE A GITHUB REPOSITORY
+------------------------------------------------------
+1. Go to https://github.com/new
+2. Name it something like "customer-service-chatbot"
+3. Set it to Public or Private (either works with Railway)
+4. Do NOT add README / .gitignore (you already have files)
+5. Click "Create repository"
+6. Copy the remote URL shown, e.g.:
+   https://github.com/YOUR_USERNAME/customer-service-chatbot.git
+
+------------------------------------------------------
+STEP 2 — PUSH YOUR CODE TO GITHUB
+------------------------------------------------------
+Run these commands from your project folder:
+
+  git init
+  git add .
+  git commit -m "Initial commit: Railway-ready chatbot"
+  git branch -M main
+  git remote add origin https://github.com/YOUR_USERNAME/customer-service-chatbot.git
+  git push -u origin main
+
+------------------------------------------------------
+STEP 3 — CREATE A NEW RAILWAY PROJECT
+------------------------------------------------------
+1. Go to https://railway.app and log in
+2. Click "New Project"
+3. Choose "Deploy from GitHub repo"
+4. Authorize Railway to access your GitHub account
+5. Select the repository you just created
+6. Railway will auto-detect Python and start a first deployment
+   (it will fail until you add env variables — that's OK)
+
+------------------------------------------------------
+STEP 4 — SET ENVIRONMENT VARIABLES IN RAILWAY
+------------------------------------------------------
+1. In your Railway project, click on the web service
+2. Go to the "Variables" tab
+3. Add each variable one by one:
+
+   CLAUDE_API_KEY   →  sk-ant-...your key...
+   DATABASE_URL     →  postgresql://...your supabase url...  (optional)
+   ENVIRONMENT      →  production
+
+4. Railway automatically injects PORT — do NOT set it manually
+
+------------------------------------------------------
+STEP 5 — TRIGGER A DEPLOYMENT
+------------------------------------------------------
+Railway re-deploys automatically when you push to GitHub.
+To force a manual re-deploy:
+1. Go to the "Deployments" tab
+2. Click "Deploy" on the latest commit
+
+------------------------------------------------------
+STEP 6 — VERIFY YOUR DEPLOYMENT
+------------------------------------------------------
+1. Once the build turns green, click "View Logs" to confirm:
+     INFO:     Application startup complete.
+2. Click "Settings" → copy your public URL, e.g.:
+     https://customer-service-chatbot-production.up.railway.app
+3. Test the health endpoint in your browser or with curl:
+     curl https://YOUR_APP.up.railway.app/health
+   Expected response:
+     {"status":"ok","timestamp":"...","environment":"production"}
+
+------------------------------------------------------
+STEP 7 — TEST THE CHAT ENDPOINT
+------------------------------------------------------
+  curl -X POST https://YOUR_APP.up.railway.app/chat \
+    -H "Content-Type: application/json" \
+    -d '{
+      "business_id": "acme-corp",
+      "question": "What are your business hours?",
+      "knowledge_base": "We are open Monday to Friday, 9am to 5pm EST."
+    }'
+
+------------------------------------------------------
+STEP 8 — AUTO-DEPLOYMENT (ALREADY ENABLED BY DEFAULT)
+------------------------------------------------------
+Every push to the "main" branch triggers a new Railway deployment.
+No extra configuration needed.
+
+------------------------------------------------------
+OPTIONAL EXTRAS
+------------------------------------------------------
+- Custom domain:  Settings → Networking → Add Custom Domain
+- Scale replicas: Settings → Scaling
+- Persistent stats: Replace defaultdict in main.py with Supabase
+  queries using the DATABASE_URL you already set
+
+======================================================
