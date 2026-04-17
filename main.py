@@ -1,206 +1,366 @@
+"""
+main.py - CustomerServiceAgent
+
+Core AI agent that powers the chatbot. Import this in simple_server.py
+or run directly (python main.py) for a quick demo.
+
+Architecture:
+  CustomerServiceAgent   — orchestrates every request end-to-end
+  ConversationStore      — thread-safe in-memory store (swap for DB later)
+"""
+
 import os
-import logging
+import json
+import uuid
 import time
-from collections import defaultdict
+import logging
 from datetime import datetime
 from typing import Optional
 
-import requests
-from fastapi import FastAPI, HTTPException, Request
-from fastapi.middleware.cors import CORSMiddleware
-from fastapi.responses import JSONResponse
-from pydantic import BaseModel
+from anthropic import Anthropic, APIError, APITimeoutError
 from dotenv import load_dotenv
 
 load_dotenv()
 
+# ---------------------------------------------------------------------------
+# Logging — one format shared across the whole package
+# ---------------------------------------------------------------------------
 logging.basicConfig(
-    level=logging.INFO,
+    level=os.getenv("LOG_LEVEL", "INFO").upper(),
     format="%(asctime)s [%(levelname)s] %(name)s: %(message)s",
 )
 logger = logging.getLogger(__name__)
 
-app = FastAPI(
-    title="Customer Service Chatbot API",
-    description="AI-powered customer service chatbot backed by Claude",
-    version="1.0.0",
-)
 
-app.add_middleware(
-    CORSMiddleware,
-    allow_origins=["*"],
-    allow_credentials=True,
-    allow_methods=["*"],
-    allow_headers=["*"],
-)
+# ---------------------------------------------------------------------------
+# ConversationStore — in-memory dict, easy to swap for Supabase/Postgres
+# ---------------------------------------------------------------------------
+class ConversationStore:
+    """
+    Stores conversations keyed by (business_id, conversation_id).
 
-CLAUDE_API_KEY = os.getenv("CLAUDE_API_KEY")
-CLAUDE_API_URL = "https://api.anthropic.com/v1/messages"
-CLAUDE_MODEL = "claude-sonnet-4-6"
+    Replace the internal dict with DB calls to make storage persistent
+    across server restarts.
+    """
 
-# In-memory stats store (replace with Supabase/DB for persistence across restarts)
-stats_store: dict[str, dict] = defaultdict(lambda: {
-    "total_questions": 0,
-    "total_tokens_used": 0,
-    "last_activity": None,
-    "conversations": [],
-})
+    def __init__(self) -> None:
+        # { business_id: { conversation_id: conversation_dict } }
+        self._data: dict[str, dict[str, dict]] = {}
 
+    def save(self, business_id: str, conversation_id: str, record: dict) -> None:
+        self._data.setdefault(business_id, {})[conversation_id] = record
 
-# --------------------------------------------------------------------------- #
-# Request / Response schemas
-# --------------------------------------------------------------------------- #
+    def get_one(self, business_id: str, conversation_id: str) -> Optional[dict]:
+        return self._data.get(business_id, {}).get(conversation_id)
 
-class ChatRequest(BaseModel):
-    business_id: str
-    question: str
-    knowledge_base: str
+    def get_many(self, business_id: str, limit: int = 100) -> list[dict]:
+        records = list(self._data.get(business_id, {}).values())
+        records.sort(key=lambda r: r["timestamp"], reverse=True)
+        return records[:limit]
 
-
-class ChatResponse(BaseModel):
-    business_id: str
-    question: str
-    answer: str
-    tokens_used: int
-    response_time_ms: int
-
-
-class HealthResponse(BaseModel):
-    status: str
-    timestamp: str
-    environment: str
-
-
-class StatsResponse(BaseModel):
-    business_id: str
-    total_questions: int
-    total_tokens_used: int
-    last_activity: Optional[str]
-    recent_conversations: list
+    def stats(self, business_id: str) -> dict:
+        records = list(self._data.get(business_id, {}).values())
+        total = len(records)
+        if total == 0:
+            return {
+                "business_id": business_id,
+                "total_conversations": 0,
+                "escalation_count": 0,
+                "escalation_rate_pct": 0.0,
+                "avg_confidence": 0.0,
+                "avg_response_time_ms": 0.0,
+            }
+        escalations = sum(1 for r in records if r.get("escalated"))
+        avg_conf = sum(r.get("confidence", 0) for r in records) / total
+        avg_rt = sum(r.get("response_time_ms", 0) for r in records) / total
+        return {
+            "business_id": business_id,
+            "total_conversations": total,
+            "escalation_count": escalations,
+            "escalation_rate_pct": round(escalations / total * 100, 1),
+            "avg_confidence": round(avg_conf, 1),
+            "avg_response_time_ms": round(avg_rt, 1),
+        }
 
 
-# --------------------------------------------------------------------------- #
-# Helpers
-# --------------------------------------------------------------------------- #
-
-def _call_claude(system_prompt: str, user_message: str) -> tuple[str, int]:
-    """Call the Claude API and return (answer_text, tokens_used)."""
-    if not CLAUDE_API_KEY:
-        raise HTTPException(status_code=500, detail="CLAUDE_API_KEY is not configured")
-
-    headers = {
-        "x-api-key": CLAUDE_API_KEY,
-        "anthropic-version": "2023-06-01",
-        "content-type": "application/json",
-    }
-    payload = {
-        "model": CLAUDE_MODEL,
-        "max_tokens": 1024,
-        "system": system_prompt,
-        "messages": [{"role": "user", "content": user_message}],
-    }
-
-    try:
-        response = requests.post(CLAUDE_API_URL, headers=headers, json=payload, timeout=30)
-        response.raise_for_status()
-    except requests.exceptions.Timeout:
-        logger.error("Claude API request timed out")
-        raise HTTPException(status_code=504, detail="Claude API timed out")
-    except requests.exceptions.RequestException as exc:
-        logger.error("Claude API error: %s", exc)
-        raise HTTPException(status_code=502, detail=f"Claude API error: {exc}")
-
-    data = response.json()
-    answer = data["content"][0]["text"]
-    tokens_used = data.get("usage", {}).get("output_tokens", 0)
-    return answer, tokens_used
+# Shared store — one instance used by the whole process
+store = ConversationStore()
 
 
-# --------------------------------------------------------------------------- #
-# Endpoints
-# --------------------------------------------------------------------------- #
+# ---------------------------------------------------------------------------
+# CustomerServiceAgent
+# ---------------------------------------------------------------------------
+class CustomerServiceAgent:
+    """
+    AI-powered customer service agent backed by Claude.
 
-@app.post("/chat", response_model=ChatResponse)
-async def chat(request: ChatRequest):
-    """Answer a customer question using the provided knowledge base."""
-    logger.info("Chat request — business_id=%s question=%r", request.business_id, request.question[:80])
+    Usage:
+        agent = CustomerServiceAgent(api_key="sk-ant-...")
+        result = agent.process_question(
+            business_id="acme-corp",
+            question="What are your hours?",
+            knowledge_base="We are open Mon-Fri 9am-5pm.",
+        )
 
-    if not request.question.strip():
-        raise HTTPException(status_code=400, detail="Question cannot be empty")
-    if not request.knowledge_base.strip():
-        raise HTTPException(status_code=400, detail="knowledge_base cannot be empty")
+    The agent:
+      1. Searches the knowledge base for relevant context (keyword match).
+      2. Calls Claude with that context and asks for a JSON response that
+         includes the answer text AND a 0-100 confidence score.
+      3. Escalates to human review when confidence < ESCALATION_THRESHOLD.
+      4. Persists the full conversation record in ConversationStore.
+      5. Returns a rich dict with everything the API layer needs.
+    """
 
-    system_prompt = (
-        "You are a helpful customer service assistant. "
-        "Answer questions using only the knowledge base provided below. "
-        "If the answer is not in the knowledge base, politely say you don't have that information "
-        "and suggest the customer contact support directly.\n\n"
-        f"KNOWLEDGE BASE:\n{request.knowledge_base}"
-    )
+    ESCALATION_THRESHOLD = 80   # Escalate when confidence < this value
+    MODEL = "claude-sonnet-4-6"
+    MAX_TOKENS = 1024
+    MAX_KB_CHARS = 8000         # Trim enormous knowledge bases to save tokens
 
-    start = time.monotonic()
-    answer, tokens_used = _call_claude(system_prompt, request.question)
-    elapsed_ms = int((time.monotonic() - start) * 1000)
+    def __init__(self, api_key: str) -> None:
+        self.client = Anthropic(api_key=api_key)
+        logger.info("CustomerServiceAgent ready (model=%s)", self.MODEL)
 
-    # Update in-memory stats
-    entry = stats_store[request.business_id]
-    entry["total_questions"] += 1
-    entry["total_tokens_used"] += tokens_used
-    entry["last_activity"] = datetime.utcnow().isoformat()
-    entry["conversations"].append({
-        "question": request.question,
-        "answer": answer,
-        "tokens_used": tokens_used,
-        "timestamp": entry["last_activity"],
-    })
-    # Keep only the last 50 conversations in memory
-    entry["conversations"] = entry["conversations"][-50:]
+    # ------------------------------------------------------------------
+    # Public API
+    # ------------------------------------------------------------------
 
-    logger.info("Chat response — business_id=%s tokens=%d ms=%d", request.business_id, tokens_used, elapsed_ms)
+    def process_question(
+        self,
+        business_id: str,
+        question: str,
+        knowledge_base: str,
+    ) -> dict:
+        """
+        Full pipeline: search → generate → score → store → return.
 
-    return ChatResponse(
-        business_id=request.business_id,
-        question=request.question,
-        answer=answer,
-        tokens_used=tokens_used,
-        response_time_ms=elapsed_ms,
-    )
+        Returns a dict with these keys:
+          conversation_id, business_id, question, response, confidence,
+          escalated, escalation_reason, timestamp, response_time_ms,
+          kb_match_score, tokens_used
+        """
+        start = time.monotonic()
+        conversation_id = str(uuid.uuid4())
+        timestamp = datetime.utcnow().isoformat()
+
+        logger.info(
+            "New question | business=%s | conv=%s | q=%r",
+            business_id, conversation_id[:8], question[:80],
+        )
+
+        # 1. Find relevant context inside the knowledge base
+        context, kb_match_score = self._search_knowledge_base(question, knowledge_base)
+
+        # 2. Ask Claude for a response + confidence score
+        ai_result = self._generate_response(question, context)
+
+        # 3. Decide whether to escalate
+        confidence: int = ai_result["confidence"]
+        escalated: bool = confidence < self.ESCALATION_THRESHOLD
+        escalation_reason: Optional[str] = (
+            f"Confidence {confidence}% is below the {self.ESCALATION_THRESHOLD}% threshold — "
+            "a human agent should review this."
+            if escalated else None
+        )
+
+        response_time_ms = int((time.monotonic() - start) * 1000)
+
+        record = {
+            "conversation_id": conversation_id,
+            "business_id": business_id,
+            "question": question,
+            "response": ai_result["response"],
+            "confidence": confidence,
+            "escalated": escalated,
+            "escalation_reason": escalation_reason,
+            "timestamp": timestamp,
+            "response_time_ms": response_time_ms,
+            "kb_match_score": round(kb_match_score, 2),
+            "tokens_used": ai_result.get("tokens_used", 0),
+        }
+
+        # 4. Persist
+        store.save(business_id, conversation_id, record)
+
+        logger.info(
+            "Done | business=%s | confidence=%d%% | escalated=%s | %dms",
+            business_id, confidence, escalated, response_time_ms,
+        )
+        return record
+
+    def get_conversations(self, business_id: str, limit: int = 100) -> list[dict]:
+        """Return the most recent conversations for a business."""
+        return store.get_many(business_id, limit)
+
+    def get_conversation(self, business_id: str, conversation_id: str) -> Optional[dict]:
+        """Return one conversation by ID, or None if not found."""
+        return store.get_one(business_id, conversation_id)
+
+    def get_stats(self, business_id: str) -> dict:
+        """Return aggregate statistics for a business."""
+        return store.stats(business_id)
+
+    # ------------------------------------------------------------------
+    # Private helpers
+    # ------------------------------------------------------------------
+
+    def _search_knowledge_base(
+        self, question: str, knowledge_base: str
+    ) -> tuple[str, float]:
+        """
+        Lightweight keyword search over the knowledge base.
+
+        Splits the KB into paragraphs, scores each one by how many
+        question keywords it contains, and returns the top-5 paragraphs
+        as context alongside a 0-1 match score.
+
+        This is intentionally simple — replace with a vector DB (e.g. pgvector)
+        for production-grade semantic search.
+        """
+        # Trim very large knowledge bases to avoid huge token counts
+        kb = knowledge_base[:self.MAX_KB_CHARS]
+
+        paragraphs = [p.strip() for p in kb.splitlines() if p.strip()]
+        if not paragraphs:
+            return kb, 0.0
+
+        # Extract meaningful keywords from the question
+        stopwords = {
+            "what", "when", "where", "how", "why", "who", "which",
+            "is", "are", "am", "was", "were", "be", "been", "being",
+            "do", "does", "did", "have", "has", "had", "will", "would",
+            "could", "should", "can", "may", "might",
+            "the", "a", "an", "and", "or", "but", "in", "on", "at",
+            "to", "for", "of", "with", "by", "from", "i", "you", "we",
+            "they", "it", "my", "your", "our", "its", "me", "us",
+        }
+        keywords = {
+            w for w in question.lower().split() if w not in stopwords and len(w) > 2
+        }
+
+        if not keywords:
+            # No useful keywords → return entire (trimmed) KB
+            return kb, 0.5
+
+        # Score every paragraph
+        scored: list[tuple[float, str]] = []
+        for para in paragraphs:
+            para_lower = para.lower()
+            hits = sum(1 for kw in keywords if kw in para_lower)
+            if hits:
+                scored.append((hits / len(keywords), para))
+
+        if not scored:
+            # Nothing matched — still pass the whole KB so Claude can try
+            return kb, 0.0
+
+        scored.sort(reverse=True)
+        top_context = "\n".join(p for _, p in scored[:5])
+        best_score = scored[0][0]
+
+        return top_context, best_score
+
+    def _generate_response(self, question: str, context: str) -> dict:
+        """
+        Call Claude and parse a structured JSON reply.
+
+        Asks Claude to return ONLY a JSON object with three keys:
+          response   — the answer text shown to the customer
+          confidence — integer 0-100
+          reasoning  — internal note explaining the confidence score
+
+        Falls back to raw text with confidence=50 if JSON parsing fails.
+        """
+        system_prompt = """You are a helpful, friendly customer service assistant.
+
+Answer the customer's question using ONLY the knowledge base provided.
+If the knowledge base does not contain the answer, say so politely and
+suggest they contact support directly — do not make up information.
+
+You MUST reply with ONLY valid JSON in this exact format (no other text):
+{
+  "response": "Your answer to the customer here",
+  "confidence": 85,
+  "reasoning": "Short internal note explaining your confidence level"
+}
+
+Confidence scoring guide:
+  90-100  The knowledge base directly and completely answers the question.
+  70-89   The knowledge base partially answers the question.
+  50-69   You are inferring from related information in the knowledge base.
+  0-49    The knowledge base does not contain relevant information."""
+
+        user_message = (
+            f"KNOWLEDGE BASE:\n{context}\n\n"
+            f"CUSTOMER QUESTION: {question}\n\n"
+            "Reply with ONLY the JSON object."
+        )
+
+        try:
+            message = self.client.messages.create(
+                model=self.MODEL,
+                max_tokens=self.MAX_TOKENS,
+                system=system_prompt,
+                messages=[{"role": "user", "content": user_message}],
+            )
+        except APITimeoutError:
+            logger.error("Claude API timed out")
+            raise
+        except APIError as exc:
+            logger.error("Claude API error: %s", exc)
+            raise
+
+        raw = message.content[0].text.strip()
+        tokens_used = message.usage.output_tokens
+
+        try:
+            parsed = json.loads(raw)
+            return {
+                "response": parsed.get("response", "I'm sorry, I couldn't generate a response."),
+                "confidence": max(0, min(100, int(parsed.get("confidence", 50)))),
+                "reasoning": parsed.get("reasoning", ""),
+                "tokens_used": tokens_used,
+            }
+        except (json.JSONDecodeError, ValueError):
+            logger.warning("Could not parse JSON from Claude — using raw text, confidence=50")
+            return {
+                "response": raw,
+                "confidence": 50,
+                "reasoning": "JSON parse failed; defaulting to 50% confidence",
+                "tokens_used": tokens_used,
+            }
 
 
-@app.get("/health", response_model=HealthResponse)
-async def health():
-    """Liveness/readiness probe for Railway and load balancers."""
-    return HealthResponse(
-        status="ok",
-        timestamp=datetime.utcnow().isoformat(),
-        environment=os.getenv("ENVIRONMENT", "development"),
-    )
+# ---------------------------------------------------------------------------
+# Quick demo — run with: python main.py
+# ---------------------------------------------------------------------------
+if __name__ == "__main__":
+    api_key = os.getenv("CLAUDE_API_KEY")
+    if not api_key:
+        print("ERROR: Set CLAUDE_API_KEY in your .env file first.")
+        raise SystemExit(1)
 
+    agent = CustomerServiceAgent(api_key=api_key)
 
-@app.get("/stats/{business_id}", response_model=StatsResponse)
-async def stats(business_id: str):
-    """Return conversation statistics for a given business."""
-    entry = stats_store.get(business_id)
-    if not entry:
-        raise HTTPException(status_code=404, detail=f"No stats found for business_id '{business_id}'")
+    demo_kb = """
+    Business Hours: Monday-Friday 9am-6pm, Saturday 10am-4pm, closed Sunday.
+    Delivery: Free delivery on orders over $50. Standard delivery takes 3-5 business days.
+    Returns: Returns accepted within 30 days with original receipt.
+    Contact: Email support@example.com or call 555-1234.
+    """
 
-    return StatsResponse(
-        business_id=business_id,
-        total_questions=entry["total_questions"],
-        total_tokens_used=entry["total_tokens_used"],
-        last_activity=entry["last_activity"],
-        recent_conversations=entry["conversations"][-10:],
-    )
+    demo_questions = [
+        "What are your hours on Saturday?",
+        "Do you offer free delivery?",
+        "What is the capital of France?",   # Off-topic → should trigger escalation
+    ]
 
-
-# --------------------------------------------------------------------------- #
-# Global error handlers
-# --------------------------------------------------------------------------- #
-
-@app.exception_handler(Exception)
-async def global_exception_handler(request: Request, exc: Exception):
-    logger.exception("Unhandled exception on %s", request.url)
-    return JSONResponse(
-        status_code=500,
-        content={"detail": "An unexpected error occurred. Please try again later."},
-    )
+    for q in demo_questions:
+        print(f"\n{'─'*60}")
+        result = agent.process_question("demo-store", q, demo_kb)
+        print(f"Q:          {result['question']}")
+        print(f"A:          {result['response']}")
+        print(f"Confidence: {result['confidence']}%")
+        print(f"Escalated:  {result['escalated']}")
+        if result["escalation_reason"]:
+            print(f"Reason:     {result['escalation_reason']}")
+        print(f"Time:       {result['response_time_ms']} ms")
